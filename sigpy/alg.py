@@ -280,7 +280,8 @@ class ConjugateGradient(Alg):
                 self.rzold = rznew
 
             self.resid = self.rzold.item() ** 0.5
-
+            print(f"CG iter {self.iter}/{self.max_iter}: alpha = {self.alpha:.4e}, tol = {self.tol}, resid = {self.resid:.4e}")
+            
     def _done(self):
         return (
             self.iter >= self.max_iter
@@ -288,6 +289,142 @@ class ConjugateGradient(Alg):
             or self.resid <= self.tol
         )
 
+
+# class ConjugateGradient(Alg):
+#     r"""Conjugate gradient method.
+
+#     Solves for:
+
+#     .. math:: A x = b
+
+#     where A is a Hermitian linear operator.
+
+#     Args:
+#         A (Linop or function): Linop or function to compute A.
+#         b (array): Observation.
+#         x (array): Variable.
+#         P (function or None): Preconditioner.
+#         max_iter (int): Maximum number of iterations.
+#         tol (float): Tolerance for stopping condition.
+
+#     """
+
+#     def __init__(self, A, b, x, P=None, max_iter=100, tol=0):
+#         self.A = A
+#         self.b = b
+#         self.P = P
+#         self.x = x
+#         self.tol = tol
+#         self.device = backend.get_device(x)
+        
+#         with self.device:
+#             xp = self.device.xp
+            
+#             # Pre-allocate workspace arrays (reused every iteration)
+#             self.r = b - self.A(self.x)
+#             self.p = xp.empty_like(x)
+#             self.Ap = xp.empty_like(x)  # Reusable workspace for A(p)
+            
+#             # Allocate z only if we need preconditioner, otherwise alias r
+#             if self.P is not None:
+#                 self.z = xp.empty_like(x)
+#                 xp.copyto(self.z, self.P(self.r))
+#                 z_view = self.z
+#             else:
+#                 self.z = None
+#                 z_view = self.r
+            
+#             # Initialize p (no copy needed, just assign)
+#             xp.copyto(self.p, z_view)
+            
+#             self.not_positive_definite = False
+            
+#             # Keep rzold on GPU (scalar array, not Python scalar)
+#             self.rzold = xp.real(xp.vdot(self.r, z_view))
+            
+#             # Residual tracking for progress bars
+#             self._resid_stale = True
+#             self._resid_cache = np.inf
+
+#         super().__init__(max_iter)
+
+#     def _update(self):
+#         with self.device:
+#             xp = self.device.xp
+            
+#             # Reuse pre-allocated Ap array
+#             xp.copyto(self.Ap, self.A(self.p))
+            
+#             # Keep scalars on GPU until absolutely needed
+#             pAp = xp.real(xp.vdot(self.p, self.Ap))
+            
+#             # Only transfer to CPU for comparison (unavoidable)
+#             pAp_cpu = pAp.item()
+#             if pAp_cpu <= 0:
+#                 self.not_positive_definite = True
+#                 return
+
+#             # Compute alpha on GPU when possible
+#             alpha = self.rzold / pAp
+#             self.alpha = alpha.item()  # Store CPU version for reporting
+            
+#             # Update x: x = x + alpha * p
+#             util.axpy(self.x, self.alpha, self.p)
+            
+#             if self.iter < self.max_iter - 1:
+#                 # Update r: r = r - alpha * Ap
+#                 util.axpy(self.r, -self.alpha, self.Ap)
+                
+#                 # Apply preconditioner (reuse z workspace if allocated)
+#                 if self.P is not None:
+#                     xp.copyto(self.z, self.P(self.r))
+#                     z_view = self.z
+#                 else:
+#                     z_view = self.r
+                
+#                 # Compute new inner product
+#                 rznew = xp.real(xp.vdot(self.r, z_view))
+                
+#                 # Compute beta on GPU
+#                 beta = rznew / self.rzold
+                
+#                 # Update p: p = z + beta * p (using xpay: p = beta*p + z)
+#                 util.xpay(self.p, beta.item(), z_view)
+                
+#                 # Update rzold for next iteration
+#                 self.rzold = rznew
+                
+#             self._resid_stale = True
+
+#     @property
+#     def resid(self):
+#         """Lazy evaluation of residual - only compute when accessed."""
+#         if self._resid_stale:
+#             self._resid_cache = self.rzold.item() ** 0.5
+#             self._resid_stale = False
+#         return self._resid_cache
+    
+#     @property
+#     def residual(self):
+#         """Alias for resid to match naming convention of other algorithms."""
+#         return self.resid
+
+#     def _done(self):
+#         # Check cheap conditions first
+#         if self.iter >= self.max_iter or self.not_positive_definite:
+#             return True
+        
+#         # For progress bars, check tolerance more frequently in early iterations
+#         # Less frequently later to maintain performance
+#         if (self.iter < 50 or 
+#             self.iter % max(1, min(10, self.max_iter // 20)) == 0 or 
+#             self.iter >= self.max_iter - 3):
+#             return self.resid <= self.tol
+        
+#         return False
+    
+    
+    
 
 class PrimalDualHybridGradient(Alg):
     r"""Primal dual hybrid gradient.
@@ -377,24 +514,38 @@ class PrimalDualHybridGradient(Alg):
         super().__init__(max_iter)
 
     def _update(self):
-        # Update dual.
-        util.axpy(self.u, self.sigma, self.A(self.x_ext))
-        backend.copyto(self.u, self.proxfc(self.sigma, self.u))
+             
+        # Flush between iterations
+        import cupy as cp
+        with cp.cuda.Device(2):
+            cp.get_default_memory_pool().free_all_blocks()
+        with cp.cuda.Device(3):
+            cp.get_default_memory_pool().free_all_blocks()
+        cp.cuda.Device(2).synchronize()
+        cp.cuda.Device(3).synchronize()
 
-        # Update primal.
+        # Dual update — explicitly under GPU2 context
+        with self.u_device:
+            util.axpy(self.u, self.sigma, self.A(self.x_ext))
+            print(f'self.u.device = {sp.get_device(self.u)}, self.x_ext.device = {sp.get_device(self.x_ext)}')
+            backend.copyto(self.u, self.proxfc(self.sigma, self.u))
+
+        # Sync after dual update before primal reads u
+        cp.cuda.Device(2).synchronize()
+        
+        # Primal update — explicitly under GPU3 context
         with self.x_device:
             x_old = self.x.copy()
             util.axpy(self.x, -self.tau, self.AH(self.u))
             backend.copyto(self.x, self.proxg(self.tau, self.x))
 
-        # Update step-size if neccessary.
+        # Step size updates
         if self.gamma_primal > 0 and self.gamma_dual == 0:
             with self.x_device:
                 xp = self.x_device.xp
                 theta = 1 / (1 + 2 * self.gamma_primal * self.tau_min) ** 0.5
                 self.tau *= theta
                 self.tau_min *= theta
-
             with self.u_device:
                 self.sigma /= theta
         elif self.gamma_primal == 0 and self.gamma_dual > 0:
@@ -403,18 +554,20 @@ class PrimalDualHybridGradient(Alg):
                 theta = 1 / (1 + 2 * self.gamma_dual * self.sigma_min) ** 0.5
                 self.sigma *= theta
                 self.sigma_min *= theta
-
             with self.x_device:
                 self.tau /= theta
         else:
             theta = self.theta
 
-        # Extrapolate primal.
+        # Extrapolate — GPU3
         with self.x_device:
             xp = self.x_device.xp
             x_diff = self.x - x_old
-            self.resid = xp.linalg.norm(x_diff / self.tau**0.5).item()
+            self.resid = xp.linalg.norm(x_diff / self.tau ** 0.5).item()
             backend.copyto(self.x_ext, self.x + theta * x_diff)
+
+        # Sync x_ext write before next iteration reads it on GPU2 via A(x_ext)
+        cp.cuda.Device(3).synchronize()
 
     def _done(self):
         return (self.iter >= self.max_iter) or (self.resid <= self.tol)
