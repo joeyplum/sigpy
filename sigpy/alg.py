@@ -8,6 +8,7 @@ import numpy as np
 
 import sigpy as sp
 from sigpy import backend, util
+import cupy as cp
 
 
 class Alg(object):
@@ -514,26 +515,27 @@ class PrimalDualHybridGradient(Alg):
         super().__init__(max_iter)
 
     def _update(self):
-             
-        # Flush between iterations
-        import cupy as cp
-        with cp.cuda.Device(2):
-            cp.get_default_memory_pool().free_all_blocks()
-        with cp.cuda.Device(3):
-            cp.get_default_memory_pool().free_all_blocks()
-        cp.cuda.Device(2).synchronize()
-        cp.cuda.Device(3).synchronize()
+        x_id = self.x_device.id
+        u_id = self.u_device.id
 
-        # Dual update — explicitly under GPU2 context
+        # Flush and sync all involved devices
+        devices = list(dict.fromkeys([x_id, u_id]))  # unique, order-preserved
+        for dev_id in devices:
+            with cp.cuda.Device(dev_id):
+                cp.get_default_memory_pool().free_all_blocks()
+        for dev_id in devices:
+            cp.cuda.Device(dev_id).synchronize()
+
+        # Dual update
         with self.u_device:
             util.axpy(self.u, self.sigma, self.A(self.x_ext))
-            print(f'self.u.device = {sp.get_device(self.u)}, self.x_ext.device = {sp.get_device(self.x_ext)}')
             backend.copyto(self.u, self.proxfc(self.sigma, self.u))
 
-        # Sync after dual update before primal reads u
-        cp.cuda.Device(2).synchronize()
-        
-        # Primal update — explicitly under GPU3 context
+        # Sync after dual update — only needed if devices differ
+        if x_id != u_id:
+            cp.cuda.Device(u_id).synchronize()
+
+        # Primal update
         with self.x_device:
             x_old = self.x.copy()
             util.axpy(self.x, -self.tau, self.AH(self.u))
@@ -559,15 +561,16 @@ class PrimalDualHybridGradient(Alg):
         else:
             theta = self.theta
 
-        # Extrapolate — GPU3
+        # Extrapolate
         with self.x_device:
             xp = self.x_device.xp
             x_diff = self.x - x_old
             self.resid = xp.linalg.norm(x_diff / self.tau ** 0.5).item()
             backend.copyto(self.x_ext, self.x + theta * x_diff)
 
-        # Sync x_ext write before next iteration reads it on GPU2 via A(x_ext)
-        cp.cuda.Device(3).synchronize()
+        # Sync x_ext write before next iteration — only needed if devices differ
+        if x_id != u_id:
+            cp.cuda.Device(x_id).synchronize()
 
     def _done(self):
         return (self.iter >= self.max_iter) or (self.resid <= self.tol)
