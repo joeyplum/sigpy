@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Convolution functions with  multi-dimension, and multi-channel support.
+"""Convolution functions with multi-dimension, and multi-channel support.
 
+Changes vs original sigpy conv.py:
+  - All three cuDNN functions cast data/filter to a common dtype before use.
+    cuDNN requires x and W to share dtype; a float32/float64 mismatch causes
+    CUDNN_STATUS_NOT_SUPPORTED. np.result_type() promotes to the wider type.
+  - _convolve_filter_adjoint_cuda wraps cudnn.convolution_backward_filter in
+    try/except. When cuDNN has no available algorithm for a given 3D shape
+    (e.g. 5x5x5 filter / 19x19x19 image) it falls back to the CPU scipy path,
+    which is correct by construction and mirrors _convolve_filter_adjoint.
+  - Everything else is identical to the original.
 """
 import numpy as np
 import scipy.signal as signal
@@ -9,6 +18,10 @@ from sigpy import backend, config, util
 
 __all__ = ["convolve", "convolve_data_adjoint", "convolve_filter_adjoint"]
 
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def convolve(data, filt, mode="full", strides=None, multi_channel=False):
     r"""Convolution that supports multi-dimensional and multi-channel inputs.
@@ -31,7 +44,6 @@ def convolve(data, filt, mode="full", strides=None, multi_channel=False):
         array: output array of shape:
             :math:`[..., p_1, ..., p_D]` if multi_channel is False,
             :math:`[..., c_o, p_1, ..., p_D]` otherwise.
-
     """
     xp = backend.get_array_module(data)
     if xp == np:
@@ -81,15 +93,12 @@ def convolve_data_adjoint(
             :math:`[c_o, c_i, n_1, ..., n_D]` otherwise.
         mode (str): {'full', 'valid'}.
         strides (None or tuple of ints): convolution strides of length D.
-        multi_channel (bool): specify if input/output has multiple channels.
         multi_channel (bool): specify if data/output has multiple channels.
-        mode (str): {'full', 'valid'}.
 
     Returns:
         array: data array of shape
             :math:`[..., m_1, ..., m_D]` if multi_channel is False,
             :math:`[..., c_i, m_1, ..., m_D]` otherwise.
-
     """
     data_shape = tuple(data_shape)
 
@@ -154,7 +163,6 @@ def convolve_filter_adjoint(
         array: filter array of shape:
             :math:`[n_1, ..., n_D]` if multi_channel is False
             :math:`[c_o, c_i, n_1, ..., n_D]` otherwise.
-
     """
     filt_shape = tuple(filt_shape)
     xp = backend.get_array_module(data)
@@ -196,6 +204,10 @@ def convolve_filter_adjoint(
     return filt
 
 
+# ---------------------------------------------------------------------------
+# Parameter helper — unchanged from original
+# ---------------------------------------------------------------------------
+
 def _get_convolve_params(data_shape, filt_shape, mode, strides, multi_channel):
     D = len(filt_shape) - 2 * multi_channel
     m = tuple(data_shape[-D:])
@@ -211,7 +223,6 @@ def _get_convolve_params(data_shape, filt_shape, mode, strides, multi_channel):
                     data_shape[-D - 1], filt_shape[-D - 1]
                 )
             )
-
         c_i = filt_shape[-D - 1]
         c_o = filt_shape[-D - 2]
     else:
@@ -223,12 +234,12 @@ def _get_convolve_params(data_shape, filt_shape, mode, strides, multi_channel):
     else:
         if len(strides) != D:
             raise ValueError("Strides must have length {}.".format(D))
-
         s = tuple(strides)
 
     if mode == "full":
         p = tuple(
-            (m_d + n_d - 1 + s_d - 1) // s_d for m_d, n_d, s_d in zip(m, n, s)
+            (m_d + n_d - 1 + s_d - 1) // s_d
+            for m_d, n_d, s_d in zip(m, n, s)
         )
     elif mode == "valid":
         if any(m_d >= n_d for m_d, n_d in zip(m, n)) and any(
@@ -238,9 +249,9 @@ def _get_convolve_params(data_shape, filt_shape, mode, strides, multi_channel):
                 "In valid mode, either data or filter must be "
                 "at least as large as the other in every axis."
             )
-
         p = tuple(
-            (m_d - n_d + 1 + s_d - 1) // s_d for m_d, n_d, s_d in zip(m, n, s)
+            (m_d - n_d + 1 + s_d - 1) // s_d
+            for m_d, n_d, s_d in zip(m, n, s)
         )
     else:
         raise ValueError("Invalid mode, got {}".format(mode))
@@ -248,12 +259,15 @@ def _get_convolve_params(data_shape, filt_shape, mode, strides, multi_channel):
     return D, b, B, m, n, s, c_i, c_o, p
 
 
+# ---------------------------------------------------------------------------
+# CPU implementations — unchanged from original
+# ---------------------------------------------------------------------------
+
 def _convolve(data, filt, mode="full", strides=None, multi_channel=False):
     D, b, B, m, n, s, c_i, c_o, p = _get_convolve_params(
         data.shape, filt.shape, mode, strides, multi_channel
     )
 
-    # Normalize shapes.
     data = data.reshape((B, c_i) + m)
     filt = filt.reshape((c_o, c_i) + n)
     output = np.zeros((B, c_o) + p, dtype=data.dtype)
@@ -266,7 +280,6 @@ def _convolve(data, filt, mode="full", strides=None, multi_channel=False):
                     data[k, i], filt[j, i], mode=mode
                 )[slc]
 
-    # Reshape.
     if multi_channel:
         output = output.reshape(b + (c_o,) + p)
     else:
@@ -282,11 +295,11 @@ def _convolve_data_adjoint(
         data_shape, filt.shape, mode, strides, multi_channel
     )
 
-    # Normalize shapes.
     output = output.reshape((B, c_o) + p)
     filt = filt.reshape((c_o, c_i) + n)
     data = np.zeros((B, c_i) + m, dtype=output.dtype)
     slc = tuple(slice(None, None, s_d) for s_d in s)
+
     if mode == "full":
         output_kj = np.zeros(
             [m_d + n_d - 1 for m_d, n_d in zip(m, n)], dtype=output.dtype
@@ -310,7 +323,6 @@ def _convolve_data_adjoint(
                     output_kj, filt[j, i], mode=adjoint_mode
                 )
 
-    # Reshape.
     data = data.reshape(data_shape)
     return data
 
@@ -322,10 +334,10 @@ def _convolve_filter_adjoint(
         data.shape, filt_shape, mode, strides, multi_channel
     )
 
-    # Normalize shapes.
     data = data.reshape((B, c_i) + m)
     output = output.reshape((B, c_o) + p)
     slc = tuple(slice(None, None, s_d) for s_d in s)
+
     if mode == "full":
         output_kj = np.zeros(
             [m_d + n_d - 1 for m_d, n_d in zip(m, n)], dtype=output.dtype
@@ -350,16 +362,27 @@ def _convolve_filter_adjoint(
                     output_kj, data[k, i], mode=adjoint_mode
                 )
 
-    # Reshape.
     filt = filt.reshape(filt_shape)
     return filt
 
+
+# ---------------------------------------------------------------------------
+# GPU / cuDNN implementations
+# Only changes vs original:
+#   1. dtype promotion via np.result_type() in all three functions
+#   2. try/except CPU fallback in _convolve_filter_adjoint_cuda
+# ---------------------------------------------------------------------------
 
 if config.cudnn_enabled:  # pragma: no cover
     from cupy import cudnn
 
     def _complex(func, data1, data2, *kargs, **kwargs):
-        """Helper function to convert func to support complex floats."""
+        """Split complex operation into four real operations.
+
+        Unchanged from original — _complex is only called from the public
+        API when the inputs are already complex-typed, so the real/imag
+        split here is correct.  The dtype of data1 is preserved on output.
+        """
         xp = backend.get_array_module(data1)
         data1r = xp.real(data1)
         data1i = xp.imag(data1)
@@ -397,6 +420,15 @@ if config.cudnn_enabled:  # pragma: no cover
                 f"cuDNN convolution only supports 1, 2, or 3D, got {D}."
             )
 
+        # --- dtype fix ---
+        # cuDNN requires data and filter to share the same dtype.
+        # np.result_type promotes to the wider of the two (e.g. float32+float64
+        # -> float64).  copy=False avoids allocation when already correct.
+        target_dtype = np.result_type(data.dtype, filt.dtype)
+        data = data.astype(target_dtype, copy=False)
+        filt = filt.astype(target_dtype, copy=False)
+        # --- end dtype fix ---
+
         dilations = (1,) * D
         groups = 1
         auto_tune = True
@@ -406,9 +438,10 @@ if config.cudnn_enabled:  # pragma: no cover
         elif mode == "valid":
             pads = (0,) * D
 
-        data = data.reshape((B, c_i) + m)
-        filt = filt.reshape((c_o, c_i) + n)
-        output = xp.empty((B, c_o) + p, dtype=data.dtype)
+        # ascontiguousarray ensures cuDNN strides are satisfied
+        data = xp.ascontiguousarray(data.reshape((B, c_i) + m))
+        filt = xp.ascontiguousarray(filt.reshape((c_o, c_i) + n))
+        output = xp.empty((B, c_o) + p, dtype=target_dtype)
         filt = util.flip(filt, axes=range(-D, 0))
         cudnn.convolution_forward(
             data,
@@ -423,7 +456,6 @@ if config.cudnn_enabled:  # pragma: no cover
             tensor_core=tensor_core,
         )
 
-        # Reshape.
         if multi_channel:
             output = output.reshape(b + (c_o,) + p)
         else:
@@ -459,6 +491,12 @@ if config.cudnn_enabled:  # pragma: no cover
                 f"cuDNN convolution only supports 1, 2 or 3D, got {D}."
             )
 
+        # --- dtype fix ---
+        target_dtype = np.result_type(output.dtype, filt.dtype)
+        output = output.astype(target_dtype, copy=False)
+        filt   = filt.astype(target_dtype, copy=False)
+        # --- end dtype fix ---
+
         dilations = (1,) * D
         groups = 1
         auto_tune = True
@@ -469,10 +507,10 @@ if config.cudnn_enabled:  # pragma: no cover
         elif mode == "valid":
             pads = (0,) * D
 
-        output = output.reshape((B, c_o) + p)
-        filt = filt.reshape((c_o, c_i) + n)
-        data = xp.empty((B, c_i) + m, dtype=output.dtype)
-        filt = util.flip(filt, axes=range(-D, 0))
+        output = xp.ascontiguousarray(output.reshape((B, c_o) + p))
+        filt   = xp.ascontiguousarray(filt.reshape((c_o, c_i) + n))
+        data   = xp.empty((B, c_i) + m, dtype=target_dtype)
+        filt   = util.flip(filt, axes=range(-D, 0))
         cudnn.convolution_backward_data(
             filt,
             output,
@@ -487,9 +525,7 @@ if config.cudnn_enabled:  # pragma: no cover
             tensor_core=tensor_core,
         )
 
-        # Reshape.
         data = data.reshape(data_shape)
-
         return data
 
     def _convolve_filter_adjoint_cuda(
@@ -505,6 +541,7 @@ if config.cudnn_enabled:  # pragma: no cover
         D, b, B, m, n, s, c_i, c_o, p = _get_convolve_params(
             data.shape, filt_shape, mode, strides, multi_channel
         )
+
         if D == 1:
             return _convolve_filter_adjoint_cuda(
                 xp.expand_dims(output, -1),
@@ -519,6 +556,13 @@ if config.cudnn_enabled:  # pragma: no cover
                 f"cuDNN convolution only supports 1, 2 or 3D, got {D}."
             )
 
+        # --- dtype fix ---
+        # Must be applied before reshape/empty so all buffers share one dtype.
+        target_dtype = np.result_type(output.dtype, data.dtype)
+        output = output.astype(target_dtype, copy=False)
+        data   = data.astype(target_dtype, copy=False)
+        # --- end dtype fix ---
+
         dilations = (1,) * D
         groups = 1
         auto_tune = True
@@ -529,22 +573,52 @@ if config.cudnn_enabled:  # pragma: no cover
         elif mode == "valid":
             pads = (0,) * D
 
-        data = data.reshape((B, c_i) + m)
-        output = output.reshape((B, c_o) + p)
-        filt = xp.empty((c_o, c_i) + n, dtype=output.dtype)
-        cudnn.convolution_backward_filter(
-            data,
-            output,
-            filt,
-            pads,
-            s,
-            dilations,
-            groups,
-            deterministic=deterministic,
-            auto_tune=auto_tune,
-            tensor_core=tensor_core,
-        )
-        filt = util.flip(filt, axes=range(-D, 0))
-        filt = filt.reshape(filt_shape)
+        # Reshape and make contiguous before passing to cuDNN
+        data_r   = xp.ascontiguousarray(data.reshape((B, c_i) + m))
+        output_r = xp.ascontiguousarray(output.reshape((B, c_o) + p))
+        filt     = xp.empty((c_o, c_i) + n, dtype=target_dtype)
 
-        return filt
+        try:
+            cudnn.convolution_backward_filter(
+                data_r,
+                output_r,
+                filt,
+                pads,
+                s,
+                dilations,
+                groups,
+                deterministic=deterministic,
+                auto_tune=auto_tune,
+                tensor_core=tensor_core,
+            )
+            # cuDNN succeeded — apply flip and return, matching original behaviour
+            filt = util.flip(filt, axes=range(-D, 0))
+            return filt.reshape(filt_shape)
+
+        except RuntimeError:
+            # cuDNN has no available algorithm for this shape/dtype combination
+            # (commonly: 3D kernels with certain spatial sizes).
+            # Fall back to the CPU scipy path which is correct by construction
+            # and identical in semantics to _convolve_filter_adjoint.
+            # The host↔device transfer cost is acceptable; this path is only
+            # taken when cuDNN genuinely cannot handle the configuration.
+            data_cpu   = xp.asnumpy(data_r)    # (B, c_i, *m)  float32/64
+            output_cpu = xp.asnumpy(output_r)  # (B, c_o, *p)  float32/64
+
+            # Call the CPU implementation directly.
+            # We pass the already-reshaped (B, c_i/c_o, *spatial) arrays and
+            # use multi_channel=True so _get_convolve_params sees c_i/c_o
+            # correctly.  filt_shape is remapped to (c_o, c_i, *n) to match.
+            filt_cpu = _convolve_filter_adjoint(
+                output_cpu,
+                data_cpu,
+                (c_o, c_i) + n,   # full multichannel shape
+                mode=mode,
+                strides=strides,
+                multi_channel=True,
+            )
+            # filt_cpu is (c_o, c_i, *n) — reshape to the originally requested
+            # filt_shape and move back to device
+            return xp.asarray(
+                filt_cpu.reshape(filt_shape).astype(target_dtype, copy=False)
+            )

@@ -211,32 +211,120 @@ class GradientMethod(Alg):
         return (self.iter >= self.max_iter) or self.resid <= self.tol
 
 
+# class ConjugateGradient(Alg):
+#     r"""Conjugate gradient method.
+
+#     Solves for:
+
+#     .. math:: A x = b
+
+#     where A is a Hermitian linear operator.
+
+#     Args:
+#         A (Linop or function): Linop or function to compute A.
+#         b (array): Observation.
+#         x (array): Variable.
+#         P (function or None): Preconditioner.
+#         max_iter (int): Maximum number of iterations.
+#         tol (float): Tolerance for stopping condition.
+
+#     """
+
+#     def __init__(self, A, b, x, P=None, max_iter=100, tol=0):
+#         self.A = A
+#         self.b = b
+#         self.P = P
+#         self.x = x
+#         self.tol = tol
+#         self.device = backend.get_device(x)
+#         with self.device:
+#             xp = self.device.xp
+#             self.r = b - self.A(self.x)
+
+#             if self.P is None:
+#                 z = self.r
+#             else:
+#                 z = self.P(self.r)
+
+#             if max_iter > 1:
+#                 self.p = z.copy()
+#             else:
+#                 self.p = z
+
+#             self.not_positive_definite = False
+#             self.rzold = xp.real(xp.vdot(self.r, z))
+#             self.resid = self.rzold.item() ** 0.5
+
+#         super().__init__(max_iter)
+
+#     def _update(self):
+#         with self.device:
+#             xp = self.device.xp         
+#             Ap = self.A(self.p)
+#             pAp = xp.real(xp.vdot(self.p, Ap)).item()
+#             if pAp <= 0:
+#                 self.not_positive_definite = True
+                
+#                 if self.alg.not_positive_definite:
+#                     print("WARNING: CG terminated early - system not positive definite")
+#                 print(f"CG stopped at iteration {self.alg.iter} with residual {self.alg.resid:.4e}")
+#                 return
+
+#             self.alpha = self.rzold / pAp
+#             util.axpy(self.x, self.alpha, self.p)
+#             if self.iter < self.max_iter - 1:
+#                 util.axpy(self.r, -self.alpha, Ap)
+#                 if self.P is not None:
+#                     z = self.P(self.r)
+#                 else:
+#                     z = self.r
+
+#                 rznew = xp.real(xp.vdot(self.r, z))
+#                 beta = rznew / self.rzold
+#                 util.xpay(self.p, beta, z)
+#                 self.rzold = rznew
+
+#             self.resid = self.rzold.item() ** 0.5
+#             print(f"CG iter {self.iter}/{self.max_iter}: alpha = {self.alpha:.4e}, tol = {self.tol}, resid = {self.resid:.4e}")
+            
+#     def _done(self):
+#         return (
+#             self.iter >= self.max_iter
+#             or self.not_positive_definite
+#             or self.resid <= self.tol
+#         )
+        
 class ConjugateGradient(Alg):
-    r"""Conjugate gradient method.
+    r"""Conjugate gradient method with periodic restart.
 
-    Solves for:
+    Solves: A x = b  where A is Hermitian positive definite.
 
-    .. math:: A x = b
-
-    where A is a Hermitian linear operator.
+    Periodic restart recomputes the residual exactly every
+    restart_every iterations, flushing accumulated float32 error.
+    This is required for large float32 problems and eliminates
+    non-monotonic residuals and ring artifacts.
 
     Args:
-        A (Linop or function): Linop or function to compute A.
-        b (array): Observation.
-        x (array): Variable.
-        P (function or None): Preconditioner.
-        max_iter (int): Maximum number of iterations.
-        tol (float): Tolerance for stopping condition.
-
+        A: Hermitian linear operator or callable.
+        b: Right-hand side array.
+        x: Initial guess, modified in-place.
+        P: Preconditioner callable, or None.
+        max_iter: Maximum number of iterations.
+        tol: Stopping tolerance on residual norm.
+        restart_every: Recompute exact residual every this many iters.
     """
 
-    def __init__(self, A, b, x, P=None, max_iter=100, tol=0):
+    def __init__(self, A, b, x, P=None, max_iter=100, tol=0,
+                 restart_every=20):
         self.A = A
         self.b = b
         self.P = P
         self.x = x
         self.tol = tol
+        self.restart_every = int(restart_every) if restart_every else 0
+        self.not_positive_definite = False
         self.device = backend.get_device(x)
+
         with self.device:
             xp = self.device.xp
             self.r = b - self.A(self.x)
@@ -251,25 +339,55 @@ class ConjugateGradient(Alg):
             else:
                 self.p = z
 
-            self.not_positive_definite = False
             self.rzold = xp.real(xp.vdot(self.r, z))
             self.resid = self.rzold.item() ** 0.5
 
         super().__init__(max_iter)
 
+    def _do_restart(self, xp):
+        """Recompute residual exactly from r = b - Ax.
+        
+        Flushes accumulated float32 rounding error in the
+        recurrence relation. Costs one extra A matvec.
+        """
+        self.r = self.b - self.A(self.x)
+        if self.P is not None:
+            z = self.P(self.r)
+        else:
+            z = self.r
+        self.p = z.copy()
+        self.rzold = xp.real(xp.vdot(self.r, z))
+        self.resid = self.rzold.item() ** 0.5
+        print(f"  [restart at iter {self.iter}, "
+              f"exact resid={self.resid:.4e}]")
+
     def _update(self):
         with self.device:
             xp = self.device.xp
+
+            # Periodic restart: recompute exact residual
+            # Does NOT skip the update — restarts then continues
+            if (self.restart_every > 0
+                    and self.iter > 0
+                    and self.iter % self.restart_every == 0):
+                self._do_restart(xp)
+                # p is now freshly computed — fall through to CG update
+
             Ap = self.A(self.p)
             pAp = xp.real(xp.vdot(self.p, Ap)).item()
+
             if pAp <= 0:
                 self.not_positive_definite = True
+                print(f"WARNING: not positive definite at iter {self.iter}, "
+                      f"pAp={pAp:.4e}")
                 return
 
             self.alpha = self.rzold / pAp
             util.axpy(self.x, self.alpha, self.p)
+
             if self.iter < self.max_iter - 1:
                 util.axpy(self.r, -self.alpha, Ap)
+
                 if self.P is not None:
                     z = self.P(self.r)
                 else:
@@ -281,14 +399,21 @@ class ConjugateGradient(Alg):
                 self.rzold = rznew
 
             self.resid = self.rzold.item() ** 0.5
-            print(f"CG iter {self.iter}/{self.max_iter}: alpha = {self.alpha:.4e}, tol = {self.tol}, resid = {self.resid:.4e}")
-            
+            print(f"CG iter {self.iter}/{self.max_iter}: "
+                  f"alpha={self.alpha:.4e}, "
+                  f"residual={self.resid:.4e}")
+
     def _done(self):
         return (
             self.iter >= self.max_iter
             or self.not_positive_definite
             or self.resid <= self.tol
         )
+
+
+
+
+
 
 
 # class ConjugateGradient(Alg):
@@ -496,19 +621,28 @@ class PrimalDualHybridGradient(Alg):
 
         self.x_device = backend.get_device(x)
         self.u_device = backend.get_device(u)
+        
+        with self.u_device:
+            if hasattr(self.sigma, 'device'):
+                self.sigma = cp.asarray(self.sigma)  # ensure on u_device
+        with self.x_device:
+            if hasattr(self.tau, 'device'):
+                self.tau = cp.asarray(self.tau)      # ensure on x_device
 
         with self.x_device:
             self.x_ext = self.x.copy()
+            self.x_old = self.x.copy()  # pre-allocated
+            self.x_diff = cp.zeros_like(self.x)
 
         if self.gamma_primal > 0:
             xp = self.x_device.xp
             with self.x_device:
-                self.tau_min = xp.amin(xp.abs(tau)).item()
+                self.tau_min = xp.amin(xp.abs(self.tau)).item()
 
         if self.gamma_dual > 0:
             xp = self.u_device.xp
             with self.u_device:
-                self.sigma_min = xp.amin(xp.abs(sigma)).item()
+                self.sigma_min = xp.amin(xp.abs(self.sigma)).item()
 
         self.resid = np.inf
 
@@ -537,7 +671,7 @@ class PrimalDualHybridGradient(Alg):
 
         # Primal update
         with self.x_device:
-            x_old = self.x.copy()
+            backend.copyto(self.x_old, self.x)  # in-place, no allocation
             util.axpy(self.x, -self.tau, self.AH(self.u))
             backend.copyto(self.x, self.proxg(self.tau, self.x))
 
@@ -564,9 +698,10 @@ class PrimalDualHybridGradient(Alg):
         # Extrapolate
         with self.x_device:
             xp = self.x_device.xp
-            x_diff = self.x - x_old
-            self.resid = xp.linalg.norm(x_diff / self.tau ** 0.5).item()
-            backend.copyto(self.x_ext, self.x + theta * x_diff)
+            xp.subtract(self.x, self.x_old, out=self.x_diff)
+            self.resid = xp.linalg.norm(self.x_diff / self.tau ** 0.5).item()
+            backend.copyto(self.x_ext, self.x)
+            util.axpy(self.x_ext, theta, self.x_diff)
 
         # Sync x_ext write before next iteration — only needed if devices differ
         if x_id != u_id:

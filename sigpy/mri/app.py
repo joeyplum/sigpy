@@ -6,6 +6,7 @@ import numpy as np
 import sigpy as sp
 from sigpy.mri import linop
 
+
 __all__ = [
     "SenseRecon",
     "L1WaveletRecon",
@@ -411,6 +412,8 @@ class JsenseRecon(sp.app.App):
             )
 
     def _get_alg(self):
+        self._iter_count = 0
+
         def min_mps_ker():
             self.A_mps_ker = linop.ConvImage(
                 self.mps_ker.shape,
@@ -444,27 +447,139 @@ class JsenseRecon(sp.app.App):
                 show_pbar=False,
             ).run()
 
+            self._iter_count += 1
+            self._plot_intermediate(self._iter_count)
+
         self.alg = sp.alg.AltMin(
             min_mps_ker, min_img_ker, max_iter=self.max_iter
         )
 
-    def _output(self):
+    def _plot_intermediate(self, iteration):
+        """Plot magnitude * phase for all coils at the current iterate.
+
+        Single row, no gaps, no labels, no title, max 1.5 inches tall.
+        """
+        import matplotlib.pyplot as plt
+
         xp = self.device.xp
-        # Normalize by root-sum-of-squares.
+
         with self.device:
-            rss = 0
-            mps = np.empty([self.num_coils] + self.img_shape, dtype=self.dtype)
+            rss = xp.zeros(self.img_shape, dtype=xp.float32)
+            mps_list = []
             for c in range(self.num_coils):
                 mps_c = sp.ifft(sp.resize(self.mps_ker[c], self.img_shape))
                 rss += xp.abs(mps_c) ** 2
+                mps_list.append(sp.to_device(mps_c))
+
+            rss_np = sp.to_device(xp.sqrt(rss))
+            eps = 0.02 * float(rss_np.max())
+            rss_safe = np.where(rss_np > eps, rss_np, np.ones_like(rss_np))
+
+            mps_np = np.stack(
+                [m / rss_safe for m in mps_list], axis=0
+            )  # (N_coils, *img_shape)
+
+        mag     = np.abs(mps_np)
+        phase   = np.angle(mps_np)
+        display = mag #* np.cos(phase)  # signed real: encodes phase into sign
+
+        # For 3D take central slice along first spatial axis
+        if len(self.img_shape) == 3:
+            mid = self.img_shape[0] // 2
+            display = display[:, mid, :, :]   # (N_coils, Y, X)
+        # display is now (N_coils, H, W)
+
+        n_coils = self.num_coils
+        # All coils in one row — cap at 9 so individual panels stay readable
+        ncols = min(n_coils, 9)
+
+        # figsize: width scales with number of columns; height capped at 1.5 in
+        fig, axes = plt.subplots(
+            1, ncols,
+            figsize=(ncols * 1.0, 1.0),
+            squeeze=False,
+        )
+        fig.patch.set_facecolor('black')
+
+        # Symmetric colour scale derived from all coils together
+        vmax = np.percentile(np.abs(display), 99.9)
+        vmin = 0#-vmax
+
+        for idx in range(ncols):
+            ax = axes[0][idx]
+            if idx < n_coils:
+                ax.imshow(
+                    display[idx],
+                    cmap='gray',
+                    vmin=vmin,
+                    vmax=vmax,
+                    interpolation='nearest',
+                    origin='lower',
+                    aspect='auto',
+                )
+            ax.axis('off')  # removes ticks, labels, and frame for all panels
+
+        # Remove every source of padding/spacing between subplots
+        plt.subplots_adjust(left=0, right=1, top=1, bottom=0, wspace=0, hspace=0)
+        plt.show()
+
+    def _output(self):
+        from scipy.ndimage import binary_fill_holes, binary_dilation, gaussian_filter
+
+        xp = self.device.xp
+        with self.device:
+            # --- Pass 1: RSS ---
+            rss = xp.zeros(self.img_shape, dtype=xp.float32)
+            for c in range(self.num_coils):
+                mps_c = sp.ifft(sp.resize(self.mps_ker[c], self.img_shape))
+                rss += xp.abs(mps_c) ** 2
+
+            if self.comm is not None:
+                rss_cpu = sp.to_device(rss)
+                self.comm.allreduce(rss_cpu)
+                rss = sp.to_device(rss_cpu, self.device)
+
+            rss = xp.sqrt(rss)
+
+            # --- Mask ---
+            # Tune upward (toward 0.08) if background still leaks through.
+            # Tune downward (toward 0.03) if lung parenchyma gets masked out.
+            threshold = 0.00 * float(rss.max())
+            binary_mask_np = sp.to_device(rss > threshold).astype(bool)
+
+            ndim = binary_mask_np.ndim
+
+            if ndim == 3:
+                # Per-slice fill: closes airways and cardiac chambers without
+                # bridging across slice gaps (which full 3D fill would do)
+                filled = np.stack(
+                    [binary_fill_holes(binary_mask_np[z])
+                     for z in range(binary_mask_np.shape[0])],
+                    axis=0,
+                )
+            else:
+                filled = binary_fill_holes(binary_mask_np)
+
+            # Dilation: provides margin so the mask does not clip true edge signal
+            filled = binary_dilation(filled, iterations=5).astype(np.float32)
+
+            # Narrow Gaussian feather: prevents hard-step ringing at body edge
+            # without spreading the mask into true background
+            smooth_mask = gaussian_filter(filled, sigma=0.75)
+            smooth_mask = np.clip(smooth_mask, 0.0, 1.0).astype(np.float32)
+            mask = sp.to_device(smooth_mask, self.device)
+
+            # --- Safe denominator ---
+            eps = threshold
+            rss_safe = xp.where(rss > eps, rss, xp.ones_like(rss))
+
+            # --- Pass 2: normalize and apply mask ---
+            mps = np.empty([self.num_coils] + self.img_shape, dtype=self.dtype)
+            for c in range(self.num_coils):
+                mps_c = sp.ifft(sp.resize(self.mps_ker[c], self.img_shape))
+                mps_c = (mps_c / rss_safe) * mask
                 sp.copyto(mps[c], mps_c)
 
-            rss = sp.to_device(rss)
-            if self.comm is not None:
-                self.comm.allreduce(rss)
-
-            rss = rss**0.5
-            mps /= rss
             return mps
 
 

@@ -575,6 +575,424 @@ class ImagePlot(object):
             self.ax.xaxis.set_visible(False)
             self.ax.yaxis.set_visible(False)
             self.ax.title.set_visible(False)
+class ImagePlotExtended(object):
+    """Plot a (complex) array as a flush 4-panel montage.
+
+    Panels (L→R, all sharing the same slice/orientation):
+        magnitude (gray, 0 → 95th pct) |
+        real (magma) | imaginary (magma) | phase (jet, fixed –π … π)
+
+    No colorbars. Zero padding between panels and around the figure.
+    Panel labels are rendered as small overlay text on each image.
+
+    Args:
+        im (array): numpy/cupy array, ≥2-D. May be real or complex.
+        x (int): x axis.
+        y (int): y axis.
+        z (None or int): z axis (mosaic / animation axis).
+        c (None or int): colour axis (must have size 3).
+        hide_axes (bool): toggle hiding overlay labels & suptitle.
+        title (str): figure suptitle string.
+        interpolation (str): imshow interpolation (default 'nearest').
+        save_basename (str): base name for saved png / gif / mp4.
+        fps (int): frames-per-second for gif/video export.
+    """
+
+    _PANEL_CMAPS  = ("gray",           "magma",  "magma",      "jet")
+    _PANEL_LABELS = ("mag – 95th pct", "real",   "imaginary",  "phase")
+
+    # Phase panel is index 3 — its window is always fixed to [-π, π]
+    _PHASE_IDX = 3
+
+    def __init__(
+        self,
+        im,
+        x=-1,
+        y=-2,
+        z=None,
+        c=None,
+        hide_axes=False,
+        title="",
+        interpolation="nearest",
+        save_basename="Figure",
+        fps=10,
+    ):
+        if im.ndim < 2:
+            raise TypeError(
+                "Image dimension must at least be two, got {im_ndim}".format(
+                    im_ndim=im.ndim
+                )
+            )
+        import matplotlib.pyplot as plt
+
+        self.im             = im
+        self.shape          = self.im.shape
+        self.ndim           = self.im.ndim
+        self.slices         = [s // 2 for s in self.shape]
+        self.flips          = [1] * self.ndim
+        self.x              = x % self.ndim
+        self.y              = y % self.ndim
+        self.z              = z % self.ndim if z is not None else None
+        self.c              = c % self.ndim if c is not None else None
+        self.d              = max(self.ndim - 3, 0)
+        self.hide_axes      = hide_axes
+        self.show_help      = False
+        self.title          = title
+        self.interpolation  = interpolation
+        self.entering_slice = False
+        self.save_basename  = save_basename
+        self.fps            = fps
+
+        # ---- figure: flush montage, no gaps ----
+        # top margin gives ~0.18" for suptitle at 8" wide / 2.1" tall
+        self.fig, self.axes = plt.subplots(1, 4, figsize=(8, 2.1))
+        self.fig.subplots_adjust(left=0, right=1, top=0.88,
+                                 bottom=0, wspace=0, hspace=0)
+        for ax in self.axes:
+            ax.set_facecolor("black")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+
+        # Per-panel state: [magnitude, real, imaginary, phase]
+        self.axims        = [None] * 4
+        self.vmins        = [None] * 4
+        self.vmaxs        = [None] * 4
+        self.label_texts  = [None] * 4   # overlay text handles
+        self.help_text    = None
+
+        self.fig.canvas.mpl_disconnect(
+            self.fig.canvas.manager.key_press_handler_id
+        )
+        self.fig.canvas.mpl_connect("key_press_event", self.key_press)
+        self.update_image()
+        self.update_axes()
+        self.fig.canvas.draw()
+        plt.show()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _build_panels(self):
+        """Return [|·|, Re, Im, ∠] for the current slice."""
+        idx = []
+        for i in range(self.ndim):
+            if i in (self.x, self.y, self.z, self.c):
+                idx.append(slice(None, None, self.flips[i]))
+            else:
+                idx.append(self.slices[i])
+        imv = sp.to_device(self.im[tuple(idx)])
+
+        imv_dims = [self.y, self.x]
+        if self.z is not None:
+            imv_dims = [self.z] + imv_dims
+        if self.c is not None:
+            imv_dims = imv_dims + [self.c]
+        imv = np.transpose(imv, np.argsort(np.argsort(imv_dims)))
+        imv = array_to_image(imv, color=self.c is not None)
+
+        return [np.abs(imv), np.real(imv), np.imag(imv), np.angle(imv)]
+
+    def _init_vrange(self, k, panel):
+        """Auto-initialise vmin/vmax[k] when None."""
+        if self.vmins[k] is not None and self.vmaxs[k] is not None:
+            return
+        if k == 0:                              # magnitude: 0 → p95
+            p95 = float(np.percentile(panel, 95))
+            self.vmins[k] = 0.0
+            self.vmaxs[k] = p95 if p95 > 0.0 else 1.0
+        elif k == self._PHASE_IDX:              # phase: fixed ±π
+            self.vmins[k] = -np.pi
+            self.vmaxs[k] =  np.pi
+        else:                                   # real / imag: full range
+            lo, hi = float(panel.min()), float(panel.max())
+            if lo == hi:
+                hi = lo + 1.0
+            self.vmins[k], self.vmaxs[k] = lo, hi
+
+    # ------------------------------------------------------------------
+    # Update methods
+    # ------------------------------------------------------------------
+
+    def update_image(self):
+        panels = self._build_panels()
+
+        for k, (ax, panel, cmap) in enumerate(
+                zip(self.axes, panels, self._PANEL_CMAPS)):
+
+            self._init_vrange(k, panel)
+            extent = [0, panel.shape[1], 0, panel.shape[0]]
+
+            if self.axims[k] is None:
+                self.axims[k] = ax.imshow(
+                    panel,
+                    vmin=self.vmins[k], vmax=self.vmaxs[k],
+                    cmap=cmap,
+                    origin="lower",
+                    interpolation=self.interpolation,
+                    aspect="auto",          # fill the axes rectangle
+                    extent=extent,
+                )
+            else:
+                self.axims[k].set_data(panel)
+                self.axims[k].set_extent(extent)
+                self.axims[k].set_clim(self.vmins[k], self.vmaxs[k])
+
+            # Overlay label (bottom-left, created once, visibility toggled)
+            if self.label_texts[k] is None:
+                self.label_texts[k] = ax.text(
+                    0.02, 0.02, self._PANEL_LABELS[k],
+                    transform=ax.transAxes,
+                    fontsize=5.5, color="white",
+                    va="bottom", ha="left",
+                    bbox=dict(fc="black", alpha=0.45, pad=1.5,
+                              lw=0, boxstyle="round,pad=0.3"),
+                )
+
+        # Help overlay on the magnitude panel (created once)
+        if self.help_text is None:
+            p0 = panels[0]
+            bbox_props = dict(boxstyle="round", pad=1,
+                              fc="white", alpha=0.95, lw=0)
+            self.help_text = self.axes[0].text(
+                p0.shape[1] / 2, p0.shape[0] / 2,
+                image_plot_help_str,
+                ha="center", va="center",
+                linespacing=1.5, ma="left",
+                size=8, bbox=bbox_props,
+            )
+        self.help_text.set_visible(self.show_help)
+
+    def update_axes(self):
+        # Build slice-position caption identical to ImagePlot
+        caption = "["
+        for i in range(self.ndim):
+            caption += "[" if i == self.d else " "
+            if self.flips[i] == -1 and i in (self.x, self.y, self.z, self.c):
+                caption += "-"
+            if i == self.x:
+                caption += "x"
+            elif i == self.y:
+                caption += "y"
+            elif i == self.z:
+                caption += "z"
+            elif i == self.c:
+                caption += "c"
+            elif i == self.d and self.entering_slice:
+                caption += str(self.entered_slice) + "_"
+            else:
+                caption += str(self.slices[i])
+            caption += "]" if i == self.d else " "
+        caption += "]"
+
+        visible = not self.hide_axes
+        for t in self.label_texts:
+            if t is not None:
+                t.set_visible(visible)
+
+        if visible:
+            sup = (self.title + "   " + caption) if self.title else caption
+            self.fig.suptitle(sup, fontsize=7, y=0.97,
+                              color="white",
+                              bbox=dict(fc="black", alpha=0.0, lw=0))
+        else:
+            self.fig.suptitle("")
+
+    # ------------------------------------------------------------------
+    # Key handler
+    # ------------------------------------------------------------------
+
+    def key_press(self, event):
+
+        if event.key == "up":
+            if self.d not in (self.x, self.y, self.z, self.c):
+                self.slices[self.d] = (self.slices[self.d] + 1) % self.shape[self.d]
+            else:
+                self.flips[self.d] *= -1
+            self.update_image(); self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "down":
+            if self.d not in (self.x, self.y, self.z, self.c):
+                self.slices[self.d] = (self.slices[self.d] - 1) % self.shape[self.d]
+            else:
+                self.flips[self.d] *= -1
+            self.update_image(); self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "left":
+            self.d = (self.d - 1) % self.ndim
+            self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "right":
+            self.d = (self.d + 1) % self.ndim
+            self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "x" and self.d not in (self.x, self.z, self.c):
+            if self.d == self.y:
+                self.x, self.y = self.y, self.x
+            else:
+                self.x = self.d
+            self.update_image(); self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "y" and self.d not in (self.y, self.z, self.c):
+            if self.d == self.x:
+                self.x, self.y = self.y, self.x
+            else:
+                self.y = self.d
+            self.update_image(); self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "z" and self.d not in (self.x, self.y, self.c):
+            self.z = None if self.d == self.z else self.d
+            self.update_image(); self.update_axes(); self.fig.canvas.draw()
+
+        elif (event.key == "c"
+              and self.d not in (self.x, self.y, self.z)
+              and self.shape[self.d] == 3):
+            self.c = None if self.d == self.c else self.d
+            self.update_image(); self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "t":
+            self.x, self.y = self.y, self.x
+            self.update_image(); self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "a":
+            self.hide_axes = not self.hide_axes
+            self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "f":
+            self.fig.canvas.manager.full_screen_toggle()
+
+        elif event.key == "q":
+            # Reset non-phase panels; phase stays locked to ±π
+            self.vmins = [None, None, None, -np.pi]
+            self.vmaxs = [None, None, None,  np.pi]
+            self.update_image(); self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "]":
+            for k in range(4):
+                if k == self._PHASE_IDX: continue
+                w = self.vmaxs[k] - self.vmins[k]
+                self.vmins[k] -= w * 0.1; self.vmaxs[k] -= w * 0.1
+            self.update_image(); self.fig.canvas.draw()
+
+        elif event.key == "[":
+            for k in range(4):
+                if k == self._PHASE_IDX: continue
+                w = self.vmaxs[k] - self.vmins[k]
+                self.vmins[k] += w * 0.1; self.vmaxs[k] += w * 0.1
+            self.update_image(); self.fig.canvas.draw()
+
+        elif event.key == "}":
+            for k in range(4):
+                if k == self._PHASE_IDX: continue
+                w = self.vmaxs[k] - self.vmins[k]
+                c = (self.vmaxs[k] + self.vmins[k]) / 2
+                self.vmins[k] = c - w * 1.1 / 2
+                self.vmaxs[k] = c + w * 1.1 / 2
+            self.update_image(); self.fig.canvas.draw()
+
+        elif event.key == "{":
+            for k in range(4):
+                if k == self._PHASE_IDX: continue
+                w = self.vmaxs[k] - self.vmins[k]
+                c = (self.vmaxs[k] + self.vmins[k]) / 2
+                self.vmins[k] = c - w * 0.9 / 2
+                self.vmaxs[k] = c + w * 0.9 / 2
+            self.update_image(); self.fig.canvas.draw()
+
+        elif event.key == "s":
+            filename = self.save_basename + datetime.datetime.now().strftime(
+                " %Y-%m-%d at %I.%M.%S %p.png"
+            )
+            self.fig.savefig(filename, transparent=False, format="png",
+                             bbox_inches="tight", pad_inches=0,
+                             facecolor="black")
+
+        elif event.key == "g":
+            filename = self.save_basename + datetime.datetime.now().strftime(
+                " %Y-%m-%d at %I.%M.%S %p.gif"
+            )
+            temp_basename = uuid.uuid4()
+            bbox = self.fig.get_tightbbox(self.fig.canvas.get_renderer())
+            for i in range(self.shape[self.d]):
+                self.slices[self.d] = i
+                self.update_image(); self.update_axes(); self.fig.canvas.draw()
+                self.fig.savefig("{} {:05d}.png".format(temp_basename, i),
+                                 format="png", bbox_inches=bbox, pad_inches=0)
+            subprocess.run([
+                "ffmpeg", "-f", "image2",
+                "-s", "{}x{}".format(int(bbox.width  * self.fig.dpi),
+                                     int(bbox.height * self.fig.dpi)),
+                "-framerate", str(self.fps),
+                "-i", "{} %05d.png".format(temp_basename),
+                "-vf", "palettegen", "{} palette.png".format(temp_basename),
+            ])
+            subprocess.run([
+                "ffmpeg", "-f", "image2",
+                "-s", "{}x{}".format(int(bbox.width  * self.fig.dpi),
+                                     int(bbox.height * self.fig.dpi)),
+                "-framerate", str(self.fps),
+                "-i", "{} %05d.png".format(temp_basename),
+                "-i", "{} palette.png".format(temp_basename),
+                "-lavfi", "paletteuse", filename,
+            ])
+            os.remove("{} palette.png".format(temp_basename))
+            for i in range(self.shape[self.d]):
+                os.remove("{} {:05d}.png".format(temp_basename, i))
+
+        elif event.key == "v":
+            filename = self.save_basename + datetime.datetime.now().strftime(
+                " %Y-%m-%d at %I.%M.%S %p.mp4"
+            )
+            temp_basename = uuid.uuid4()
+            for i in range(self.shape[self.d]):
+                self.slices[self.d] = i
+                self.update_image(); self.update_axes(); self.fig.canvas.draw()
+                self.fig.savefig("{} {:05d}.png".format(temp_basename, i),
+                                 format="png", bbox_inches="tight", pad_inches=0)
+            subprocess.run([
+                "ffmpeg", "-r", str(self.fps),
+                "-i", "{} %05d.png".format(temp_basename),
+                "-vf", "crop=floor(iw/2)*2-10:floor(ih/2)*2-10",
+                "-pix_fmt", "yuv420p", "-crf", "1",
+                "-vcodec", "libx264", "-preset", "veryslow", filename,
+            ])
+            for i in range(self.shape[self.d]):
+                os.remove("{} {:05d}.png".format(temp_basename, i))
+
+        elif (event.key in
+              ["0","1","2","3","4","5","6","7","8","9","backspace"]
+              and self.d not in (self.x, self.y, self.z, self.c)):
+            if self.entering_slice:
+                if event.key == "backspace":
+                    if self.entered_slice < 10:
+                        self.entering_slice = False
+                    else:
+                        self.entered_slice //= 10
+                else:
+                    self.entered_slice = self.entered_slice * 10 + int(event.key)
+            elif event.key != "backspace":
+                self.entering_slice = True
+                self.entered_slice = int(event.key)
+            self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "enter" and self.entering_slice:
+            self.entering_slice = False
+            if self.entered_slice < self.shape[self.d]:
+                self.slices[self.d] = self.entered_slice
+                self.update_image()
+            self.update_axes(); self.fig.canvas.draw()
+
+        elif event.key == "h":
+            self.show_help = not self.show_help
+            self.update_image(); self.fig.canvas.draw()
+
+        else:
+            return
+
+
+
 
 
 def mosaic_shape(batch):
