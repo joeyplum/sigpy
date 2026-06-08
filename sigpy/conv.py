@@ -5,9 +5,16 @@ Changes vs original sigpy conv.py:
   - cuDNN support removed entirely; the cudnn dependency and config import
     are gone, along with all _cuda private functions and _complex helper.
   - All three public functions now unconditionally call the CPU (_) variants.
-  - The CPU (_) variants dispatch to an FFT-based convolve/correlate helper
-    that works for N-D arrays on both CPU (via numpy/scipy FFT) and GPU
-    (via cupy FFT). This replaces cupyx.scipy.signal which only supports 1D.
+  - The CPU (_) variants dispatch to FFT-based convolve/correlate helpers
+    (_fft_convolve, _fft_correlate) that work for N-D arrays on both CPU
+    (numpy FFT) and GPU (cupy FFT), replacing cupyx.scipy.signal which only
+    supports 1D inputs.
+  - Two bugs fixed vs the previous FFT implementation:
+      1. _fft_convolve no longer discards the imaginary part via .real for
+         complex inputs — only real inputs take the .real branch.
+      2. _fft_correlate now conjugates b before flipping, matching the
+         definition correlate(a,b) = convolve(a, conj(b_flipped)). This
+         is a no-op for real inputs but critical for complex k-space data.
   - Everything else is identical to the original.
 """
 import numpy as np
@@ -23,23 +30,31 @@ __all__ = ["convolve", "convolve_data_adjoint", "convolve_filter_adjoint"]
 # ---------------------------------------------------------------------------
 
 def _fft_convolve(a, b, mode, xp):
-    """N-D convolution of a and b via FFT, using xp (numpy or cupy)."""
-    # Output size for linear (full) convolution
-    full_shape = tuple(sa + sb - 1 for sa, sb in zip(a.shape, b.shape))
+    """N-D linear convolution of a and b via FFT.
 
-    # Zero-pad both arrays to full_shape
+    Works for both real and complex inputs on CPU (xp=numpy) and GPU
+    (xp=cupy). Uses zero-padding to full linear convolution size, then
+    trims to the requested mode.
+    """
+    full_shape = tuple(sa + sb - 1 for sa, sb in zip(a.shape, b.shape))
     fa = xp.fft.fftn(a, s=full_shape)
     fb = xp.fft.fftn(b, s=full_shape)
-    out_full = xp.fft.ifftn(fa * fb).real.astype(a.dtype)
+    out_full = xp.fft.ifftn(fa * fb)
+
+    # Only discard imaginary part when both inputs are real-valued.
+    # For complex inputs (e.g. k-space data) keeping the imaginary part
+    # is essential — discarding it silently corrupts the result.
+    if not (xp.iscomplexobj(a) or xp.iscomplexobj(b)):
+        out_full = out_full.real
+
+    out_full = out_full.astype(a.dtype)
 
     if mode == "full":
         return out_full
     elif mode == "valid":
-        # Trim to valid region: output size = |a| - |b| + 1 (or vice versa)
+        # Valid region starts at min(sa,sb)-1 in each dimension
         start = tuple(min(sa, sb) - 1 for sa, sb in zip(a.shape, b.shape))
-        valid_shape = tuple(
-            abs(sa - sb) + 1 for sa, sb in zip(a.shape, b.shape)
-        )
+        valid_shape = tuple(abs(sa - sb) + 1 for sa, sb in zip(a.shape, b.shape))
         slc = tuple(slice(st, st + vs) for st, vs in zip(start, valid_shape))
         return out_full[slc]
     else:
@@ -47,12 +62,18 @@ def _fft_convolve(a, b, mode, xp):
 
 
 def _fft_correlate(a, b, mode, xp):
-    """N-D correlation of a and b via FFT (correlate = convolve with flipped b)."""
-    # Flip b along all axes to convert correlation → convolution
-    b_flipped = b
-    for ax in range(b.ndim):
-        b_flipped = xp.flip(b_flipped, axis=ax)
-    return _fft_convolve(a, b_flipped, mode=mode, xp=xp)
+    """N-D cross-correlation of a and b via FFT.
+
+    correlate(a, b) = convolve(a, conj(b_flipped))
+
+    The conjugate is essential for complex inputs and is a no-op for real
+    inputs (conj of a real array is itself).
+    """
+    # Conjugate then flip b along all spatial axes
+    b_cf = xp.conj(b)
+    for ax in range(b_cf.ndim):
+        b_cf = xp.flip(b_cf, axis=ax)
+    return _fft_convolve(a, b_cf, mode=mode, xp=xp)
 
 
 # ---------------------------------------------------------------------------
@@ -193,32 +214,12 @@ def _get_convolve_params(data_shape, filt_shape, mode, strides, multi_channel):
 
 
 # ---------------------------------------------------------------------------
-# Implementations — CPU and GPU unified via FFT-based helpers
+# Implementations — CPU (scipy) and GPU (cupy FFT) unified
 # ---------------------------------------------------------------------------
 
 def _convolve(data, filt, mode="full", strides=None, multi_channel=False):
     xp = backend.get_array_module(data)
 
-    # On CPU, delegate directly to scipy for correctness and speed
-    if xp is np:
-        D, b, B, m, n, s, c_i, c_o, p = _get_convolve_params(
-            data.shape, filt.shape, mode, strides, multi_channel
-        )
-        data = data.reshape((B, c_i) + m)
-        filt = filt.reshape((c_o, c_i) + n)
-        output = np.zeros((B, c_o) + p, dtype=data.dtype)
-        slc = tuple(slice(None, None, s_d) for s_d in s)
-        for k in range(B):
-            for j in range(c_o):
-                for i in range(c_i):
-                    output[k, j] += signal.convolve(
-                        data[k, i], filt[j, i], mode=mode
-                    )[slc]
-        if multi_channel:
-            return output.reshape(b + (c_o,) + p)
-        return output.reshape(b + p)
-
-    # On GPU, use FFT-based convolution (supports N-D, no cuDNN required)
     D, b, B, m, n, s, c_i, c_o, p = _get_convolve_params(
         data.shape, filt.shape, mode, strides, multi_channel
     )
@@ -226,12 +227,19 @@ def _convolve(data, filt, mode="full", strides=None, multi_channel=False):
     filt = filt.reshape((c_o, c_i) + n)
     output = xp.zeros((B, c_o) + p, dtype=data.dtype)
     slc = tuple(slice(None, None, s_d) for s_d in s)
+
     for k in range(B):
         for j in range(c_o):
             for i in range(c_i):
-                output[k, j] += _fft_convolve(
-                    data[k, i], filt[j, i], mode=mode, xp=xp
-                )[slc]
+                if xp is np:
+                    output[k, j] += signal.convolve(
+                        data[k, i], filt[j, i], mode=mode
+                    )[slc]
+                else:
+                    output[k, j] += _fft_convolve(
+                        data[k, i], filt[j, i], mode=mode, xp=xp
+                    )[slc]
+
     if multi_channel:
         return output.reshape(b + (c_o,) + p)
     return output.reshape(b + p)
@@ -262,19 +270,15 @@ def _convolve_data_adjoint(
         )
         adjoint_mode = "full" if all(m_d >= n_d for m_d, n_d in zip(m, n)) else "valid"
 
-    if xp is np:
-        for k in range(B):
-            for j in range(c_o):
-                for i in range(c_i):
-                    output_kj[slc] = output[k, j]
+    for k in range(B):
+        for j in range(c_o):
+            for i in range(c_i):
+                output_kj[slc] = output[k, j]
+                if xp is np:
                     data[k, i] += signal.correlate(
                         output_kj, filt[j, i], mode=adjoint_mode
                     )
-    else:
-        for k in range(B):
-            for j in range(c_o):
-                for i in range(c_i):
-                    output_kj[slc] = output[k, j]
+                else:
                     data[k, i] += _fft_correlate(
                         output_kj, filt[j, i], mode=adjoint_mode, xp=xp
                     )
@@ -308,20 +312,15 @@ def _convolve_filter_adjoint(
         adjoint_mode = "valid" if all(m_d >= n_d for m_d, n_d in zip(m, n)) else "full"
 
     filt = xp.zeros((c_o, c_i) + n, dtype=output.dtype)
-
-    if xp is np:
-        for k in range(B):
-            for j in range(c_o):
-                for i in range(c_i):
-                    output_kj[slc] = output[k, j]
+    for k in range(B):
+        for j in range(c_o):
+            for i in range(c_i):
+                output_kj[slc] = output[k, j]
+                if xp is np:
                     filt[j, i] += signal.correlate(
                         output_kj, data[k, i], mode=adjoint_mode
                     )
-    else:
-        for k in range(B):
-            for j in range(c_o):
-                for i in range(c_i):
-                    output_kj[slc] = output[k, j]
+                else:
                     filt[j, i] += _fft_correlate(
                         output_kj, data[k, i], mode=adjoint_mode, xp=xp
                     )
