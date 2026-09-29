@@ -448,7 +448,7 @@ class JsenseRecon(sp.app.App):
             ).run()
 
             self._iter_count += 1
-            self._plot_intermediate(self._iter_count)
+            # self._plot_intermediate(self._iter_count)
 
         self.alg = sp.alg.AltMin(
             min_mps_ker, min_img_ker, max_iter=self.max_iter
