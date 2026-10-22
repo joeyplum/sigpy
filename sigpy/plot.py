@@ -85,6 +85,7 @@ class ImagePlot(object):
         title="",
         interpolation="nearest",
         save_basename="Figure",
+        figsize=None,
         fps=10,
     ):
         if im.ndim < 2:
@@ -94,10 +95,13 @@ class ImagePlot(object):
                 )
             )
         import matplotlib.pyplot as plt
+        import matplotlib as mpl
+        mpl.rcParams['savefig.pad_inches'] = 0
+        mpl.rcParams['figure.dpi'] = 100     # inline render dpi
 
         self.axim = None
         self.im = im
-        self.fig = plt.figure()
+        self.fig = plt.figure(figsize=figsize)
         self.ax = self.fig.add_subplot(111)
         self.shape = self.im.shape
         self.ndim = self.im.ndim
