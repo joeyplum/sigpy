@@ -33,7 +33,8 @@ $\bf{Hotkeys:}$
     $\bf{c:}$ select current axis as color.
     $\bf{left/right:}$ change current axis.
     $\bf{up/down:}$ change slice along current axis.
-    $\bf{a:}$ toggle hide all labels, titles and axes.
+    $\bf{a:}$ toggle hide axes, labels and title.
+    $\bf{A:}$ toggle hide all (incl. colorbar and border).
     $\bf{m/p/r/i/l:}$  magnitude/phase/real/imaginary/log mode.
     $\bf{[/]:}$ change brightness.
     $\bf{\{/\}:}$ change contrast.
@@ -57,6 +58,8 @@ class ImagePlot(object):
         z (None or int): z axis.
         c (None or int): color axis.
         hide_axes (bool): toggle hiding axes, labels and title.
+        hide_all (bool): toggle hiding everything incl. colorbar and
+            border, resizing the figure so the image fills it exactly.
         mode (str): specify magnitude, phase, real, imaginary,
             and log mode. {'m', 'p', 'r', 'i', 'l'}.
         title (str): title.
@@ -74,6 +77,7 @@ class ImagePlot(object):
         z=None,
         c=None,
         hide_axes=False,
+        hide_all=False,  # JWP border edit, 20261022
         mode=None,
         colormap=None,
         vmin=None,
@@ -105,6 +109,10 @@ class ImagePlot(object):
         self.c = c % self.ndim if c is not None else None
         self.d = max(self.ndim - 3, 0)
         self.hide_axes = hide_axes
+        self.hide_all = hide_all  # JWP border edit, 20261022
+        self.cbar = None  # JWP border edit, 20261022: colorbar handle
+        self._default_pos = None  # JWP border edit, 20261022
+        self._default_figsize = None  # JWP border edit, 20261022
         self.show_help = False
         self.title = title
         self.interpolation = interpolation
@@ -218,6 +226,14 @@ class ImagePlot(object):
             self.hide_axes = not self.hide_axes
 
             self.update_axes()
+            self.fig.canvas.draw()
+
+        # JWP border edit, 20261022: 'A' toggles full hide incl. colorbar/border
+        elif event.key == "A":
+            self.hide_all = not self.hide_all
+
+            self.update_axes()
+            self.update_image()
             self.fig.canvas.draw()
 
         elif event.key == "f":
@@ -506,7 +522,8 @@ class ImagePlot(object):
             )
 
             if self.colormap is not None:
-                self.fig.colorbar(self.axim)
+                # JWP border edit, 20261022: keep handle to toggle visibility
+                self.cbar = self.fig.colorbar(self.axim)
 
         else:
             self.axim.set_data(imv)
@@ -531,8 +548,49 @@ class ImagePlot(object):
 
         self.help_text.set_visible(self.show_help)
 
+        self._apply_layout()  # JWP border edit, 20261022
+
+    # JWP border edit, 20261022: new method
+    def _apply_layout(self):
+        """Toggle colorbar/frame/figure border for the 'hide all' mode.
+
+        When active, the axes fill the whole figure and the figure is
+        resized so its aspect ratio equals the image's (H/W), giving
+        square pixels AND zero surrounding whitespace -- so the figure
+        can be copy-pasted straight into slides without a border.
+        """
+        if self.axim is None:
+            return
+
+        if self.hide_all:
+            # Capture the pristine (colorbar-adjusted) layout once.
+            if self._default_pos is None:
+                self._default_pos = self.ax.get_position(
+                    original=True
+                ).frozen()
+                self._default_figsize = self.fig.get_size_inches().copy()
+
+            if self.cbar is not None:
+                self.cbar.ax.set_visible(False)
+            self.ax.set_frame_on(False)
+
+            h, w = self.axim.get_array().shape[:2]
+            base_w = self._default_figsize[0]
+            self.fig.set_size_inches(base_w, base_w * h / w, forward=True)
+            self.ax.set_aspect("auto")
+            self.ax.set_position([0.0, 0.0, 1.0, 1.0])
+        else:
+            self.ax.set_frame_on(True)
+            self.ax.set_aspect(1.0)
+            if self.cbar is not None:
+                self.cbar.ax.set_visible(True)
+            if self._default_pos is not None:
+                self.fig.set_size_inches(self._default_figsize, forward=True)
+                self.ax.set_position(self._default_pos)
+
     def update_axes(self):
-        if not self.hide_axes:
+        # JWP border edit, 20261022: also hide ticks/title when hide_all
+        if not (self.hide_axes or self.hide_all):
             caption = "["
             for i in range(self.ndim):
                 if i == self.d:
