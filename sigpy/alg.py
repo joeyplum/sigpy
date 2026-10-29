@@ -294,6 +294,7 @@ class GradientMethod(Alg):
 #             or self.resid <= self.tol
 #         )
         
+
 class ConjugateGradient(Alg):
     r"""Conjugate gradient method with periodic restart.
 
@@ -363,7 +364,11 @@ class ConjugateGradient(Alg):
 
     def _update(self):
         with self.device:
+            # Time the iteration for performance monitoring
+            start_time = time.time()
+
             xp = self.device.xp
+            # TODO: add time to iteration printout
 
             # Periodic restart: recompute exact residual
             # Does NOT skip the update — restarts then continues
@@ -401,7 +406,8 @@ class ConjugateGradient(Alg):
             self.resid = self.rzold.item() ** 0.5
             print(f"CG iter {self.iter}/{self.max_iter}: "
                   f"alpha={self.alpha:.4e}, "
-                  f"residual={self.resid:.4e}")
+                  f"residual={self.resid:.4e}",
+                  f'{time.time() - start_time:.4f}s')
 
     def _done(self):
         return (
