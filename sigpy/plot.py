@@ -77,7 +77,7 @@ class ImagePlot(object):
         z=None,
         c=None,
         hide_axes=False,
-        hide_all=False,  # JWP border edit, 20261022
+        hide_all=True,  # JWP border edit, 20261022
         mode=None,
         colormap=None,
         vmin=None,
